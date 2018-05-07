@@ -1,0 +1,778 @@
+---
+title: "Et_submit"
+author: "DeodattaJ"
+date: "2/18/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Machine Learning Assignment I
+House Prices : Advanced Regression Techniques
+### kaggle username: DeodattaJ
+
+### Read data from files
+We read the training and test data from the csv files and print the number of columns which contain NAs.
+
+
+
+```{r readfiles}
+setwd('/Users/deodattaj/Desktop/MLII/practice_solution')
+dyn.load('/Library/Java/JavaVirtualMachines/jdk-9.0.4.jdk/Contents/Home/lib/server/libjvm.dylib')
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(moments)
+library(glmnet)
+library(caret)
+library(FSelector)
+
+library(data.table)
+
+#Load data.
+training_data = data.frame(read.csv('/Users/deodattaj/Desktop/MLII/practice_solution/train.csv'))
+test_data = data.frame(read.csv('/Users/deodattaj/Desktop/MLII/practice_solution/test.csv'))
+
+length(unique(training_data$Id)) == nrow(training_data)
+
+# Check NAs and print in descending order.
+na.cols <- which(colSums(is.na(training_data)) > 0)
+sort(colSums(sapply(training_data[na.cols], is.na)), decreasing = TRUE)
+paste('There are', length(na.cols), 'columns with missing values')
+```
+
+### NA imputation
+
+For categorical columns, we set "None" for NA values.
+For numeric columns, we set to the median values.
+Also, we drop columns which have little or not impact on final results. These are Id, PoolQC, MiscFeature, Alley and Fence.
+
+```{r NAimpute}
+
+training_data$Id <- NULL
+training_data$Utilities <- NULL
+test_data$Utilities <- NULL
+na.cols <- which(colSums(is.na(training_data)) > 0)
+sort(colSums(sapply(training_data[na.cols], is.na)), decreasing = TRUE)
+paste('There are', length(na.cols), 'columns with missing values')
+
+training_data$GarageYrBlt <- ifelse(is.na(training_data$GarageYrBlt), training_data$YearBuilt, training_data$GarageYrBlt)
+test_data$GarageYrBlt <- ifelse(is.na(test_data$GarageYrBlt), test_data$YearBuilt, test_data$GarageYrBlt)
+#training_data$GarageYrBlt - training_data$YearBuilt > 0
+
+na.cols <- which(colSums(is.na(training_data)) > 0)
+sort(colSums(sapply(training_data[na.cols], is.na)), decreasing = TRUE)
+paste('There are', length(na.cols), 'columns with missing values')
+
+dropcols <- c('PoolQC', 'MiscFeature', 'Alley', 'Fence')
+training_data[, dropcols] <- NULL
+
+numericcols <- sapply(training_data, is.numeric) | sapply(training_data, is.integer)
+totnumericcolnames <- names(training_data)[numericcols]
+totfactorcolnames <- names(training_data)[!numericcols]
+length(totnumericcolnames) + length(totfactorcolnames) == 75
+
+for(x in totfactorcolnames) {
+  lvls <- levels(training_data[[x]])
+  if(!("None" %in% lvls)) {
+  training_data[[x]] = factor(training_data[[x]], levels=c(lvls, "None"))  }
+  training_data[[x]][is.na(training_data[[x]])] = "None"
+}
+for(x in totnumericcolnames) {
+  idx <- which(is.na(training_data[[x]]))
+  training_data[idx, c(x)] <- median(training_data[[x]], na.rm = T)
+}
+na.cols <- which(colSums(is.na(training_data)) > 0)
+paste('There are now', length(na.cols), 'columns with missing values')
+
+test_data[, dropcols] <- NULL
+numericcols <- sapply(test_data, is.numeric) | sapply(test_data, is.integer)
+totnumericcolnames <- names(test_data)[numericcols]
+totfactorcolnames <- names(test_data)[!numericcols]
+length(totnumericcolnames) + length(totfactorcolnames) == 75
+for(x in totfactorcolnames) {
+  lvls <- levels(test_data[[x]])
+  if(!("None" %in% lvls)) {
+    test_data[[x]] = factor(test_data[[x]], levels=c(lvls, "None"))  }
+  test_data[[x]][is.na(test_data[[x]])] = "None"
+}
+for(x in totnumericcolnames) {
+  idx <- which(is.na(test_data[[x]]))
+  test_data[idx, c(x)] <- median(test_data[[x]], na.rm = T)
+}
+na.cols <- which(colSums(is.na(test_data)) > 0)
+paste('There are now', length(na.cols), 'columns with missing values')
+```
+
+#### Convert integers to factors
+Columns MSSubClass and MoSold do not have numeric order. They refer to time of year when house was sold or type os house.
+
+``` {r InttoFact}
+training_data$MSSubClass <- as.factor(training_data$MSSubClass)
+training_data$MoSold <- as.factor(training_data$MoSold)
+test_data$MSSubClass <- as.factor(test_data$MSSubClass)
+test_data$MoSold <- as.factor(test_data$MoSold)
+```
+
+#### log(SalePrice + 1)
+
+The SalePrice is skewed to the right. We do a log transformation to avoid mispredictions from model due to this skewness.
+
+``` {r logSalePrice}
+hist(training_data$SalePrice)
+training_data$SalePrice <- log1p(training_data$SalePrice)
+hist(training_data$SalePrice)
+```
+
+### Transforming columns
+
+#### Categorical variables with ordinal properties
+The columns below are categorical. But, they have inherent ordinal property. Hence, we convert these to ordinal integer values. They are not already ordered. Hence, we must take care to order them properly. For the description of order, we refer to the data_description.txt file available to download form kaggle competition page.
+
+
+``````{r colTransform}
+# ============================= Transform some categorical variables =============================
+# ============================= CentralAir =============================
+# Convert 2 level factor CentralAir to 0/1
+summary(training_data$CentralAir)
+boxplot(training_data$SalePrice~training_data$CentralAir,
+        main='SalePrice vs CentralAir'); grid()
+training_data$CentralAir <- as.integer(training_data$CentralAir)
+nrow(training_data[training_data$CentralAir == 1,])
+nrow(training_data[training_data$CentralAir == 2,])
+training_data$CentralAir <- training_data$CentralAir - 1
+boxplot(training_data$SalePrice~training_data$CentralAir,
+        main='SalePrice vs CentralAir'); grid()
+
+# Convert 2 level factor CentralAir to 0/1
+summary(test_data$CentralAir)
+test_data$CentralAir <- as.integer(test_data$CentralAir)
+nrow(test_data[test_data$CentralAir == 1,])
+nrow(test_data[test_data$CentralAir == 2,])
+test_data$CentralAir <- test_data$CentralAir - 1
+# ============================= Done =============================
+
+# ============================= Street =============================
+# Grvl commands lower price, set Grvl to 1 & Pave to 0
+summary(training_data$Street)
+boxplot(training_data$SalePrice~training_data$Street,
+        main='SalePrice vs Street'); grid()
+training_data$Street <- as.integer(training_data$Street)
+nrow(training_data[training_data$Street == 1,])
+nrow(training_data[training_data$Street == 2,])
+nrow(training_data[training_data$Street == 3,])
+training_data$Street <- training_data$Street - 1
+boxplot(training_data$SalePrice~training_data$Street,
+        main='SalePrice vs Street'); grid()
+
+# TEST DATA
+summary(test_data$Street)
+test_data$Street <- as.integer(test_data$Street)
+nrow(test_data[test_data$Street == 1,])
+nrow(test_data[test_data$Street == 2,])
+nrow(test_data[test_data$Street == 3,])
+test_data$Street <- test_data$Street - 1
+# ============================= Done =============================
+# ============================= LotShape =============================
+# Naturally ordinal variable of increasing irregularity, give it numeric values
+summary(training_data$LotShape)
+boxplot(training_data$SalePrice~training_data$LotShape,
+        main='SalePrice vs LotShape'); grid()
+training_data$LotShape <- as.integer(training_data$LotShape)
+nrow(training_data[training_data$LotShape == 1,])
+nrow(training_data[training_data$LotShape == 2,])
+nrow(training_data[training_data$LotShape == 3,])
+nrow(training_data[training_data$LotShape == 4,])
+nrow(training_data[training_data$LotShape == 5,])
+training_data$LotShape <- training_data$LotShape + 1
+training_data[training_data$LotShape == 5, 'LotShape'] <- 1
+boxplot(training_data$SalePrice~training_data$LotShape,
+        main='SalePrice vs LotShape'); grid()
+
+# Naturally ordinal variable of increasing irregularity, give it numeric values
+summary(test_data$LotShape)
+test_data$LotShape <- as.integer(test_data$LotShape)
+nrow(test_data[test_data$LotShape == 1,])
+nrow(test_data[test_data$LotShape == 2,])
+nrow(test_data[test_data$LotShape == 3,])
+nrow(test_data[test_data$LotShape == 4,])
+nrow(test_data[test_data$LotShape == 5,])
+test_data$LotShape <- test_data$LotShape + 1
+test_data[test_data$LotShape == 5, 'LotShape'] <- 1
+# ============================= Done =============================
+# ============================= LandContour =============================
+summary(training_data$LandContour)
+boxplot(training_data$SalePrice~training_data$LandContour,
+        main='SalePrice vs LandContour'); grid()
+training_data$LandContour <- as.integer(training_data$LandContour)
+nrow(training_data[training_data$LandContour == 1,])
+nrow(training_data[training_data$LandContour == 2,])
+nrow(training_data[training_data$LandContour == 3,])
+nrow(training_data[training_data$LandContour == 4,])
+nrow(training_data[training_data$LandContour == 5,])
+training_data$LandContour <- training_data$LandContour - 1
+training_data[training_data$LandContour == 0, 'LandContour'] <- 4
+boxplot(training_data$SalePrice~training_data$LandContour,
+        main='SalePrice vs LandContour'); grid()
+
+summary(test_data$LandContour)
+test_data$LandContour <- as.integer(test_data$LandContour)
+nrow(test_data[test_data$LandContour == 1,])
+nrow(test_data[test_data$LandContour == 2,])
+nrow(test_data[test_data$LandContour == 3,])
+nrow(test_data[test_data$LandContour == 4,])
+test_data$LandContour <- test_data$LandContour - 1
+test_data[test_data$LandContour == 0, 'LandContour'] <- 4
+# ============================= Done =============================
+# ============================= LotConfig =============================
+summary(training_data$LotConfig)
+boxplot(training_data$SalePrice~training_data$LotConfig,
+        main='SalePrice vs LotConfig'); grid()
+training_data$LotConfig <- as.integer(training_data$LotConfig)
+nrow(training_data[training_data$LotConfig == 1,])
+nrow(training_data[training_data$LotConfig == 2,])
+nrow(training_data[training_data$LotConfig == 3,])
+nrow(training_data[training_data$LotConfig == 4,])
+nrow(training_data[training_data$LotConfig == 5,])
+training_data[training_data$LotConfig == 1, 'LotConfig'] <- 7
+training_data[training_data$LotConfig == 5, 'LotConfig'] <- 7
+training_data[training_data$LotConfig == 2, 'LotConfig'] <- 8
+training_data[training_data$LotConfig == 4, 'LotConfig'] <- 8
+training_data[training_data$LotConfig == 3, 'LotConfig'] <- 6
+training_data$LotConfig <- training_data$LotConfig - 5
+boxplot(training_data$SalePrice~training_data$LotConfig,
+        main='SalePrice vs LotConfig'); grid()
+
+summary(test_data$LotConfig)
+test_data$LotConfig <- as.integer(test_data$LotConfig)
+nrow(test_data[test_data$LotConfig == 1,])
+nrow(test_data[test_data$LotConfig == 2,])
+nrow(test_data[test_data$LotConfig == 3,])
+nrow(test_data[test_data$LotConfig == 4,])
+nrow(test_data[test_data$LotConfig == 5,])
+test_data[test_data$LotConfig == 1, 'LotConfig'] <- 7
+test_data[test_data$LotConfig == 5, 'LotConfig'] <- 7
+test_data[test_data$LotConfig == 2, 'LotConfig'] <- 8
+test_data[test_data$LotConfig == 4, 'LotConfig'] <- 8
+test_data[test_data$LotConfig == 3, 'LotConfig'] <- 6
+test_data$LotConfig <- test_data$LotConfig - 5
+# ============================= Done =============================
+# ============================= LandSlope =============================
+summary(training_data$LandSlope)
+boxplot(training_data$SalePrice~training_data$LandSlope,
+        main='SalePrice vs LandSlope'); grid()
+training_data$LandSlope <- as.integer(training_data$LandSlope)
+nrow(training_data[training_data$LandSlope == 1,])
+nrow(training_data[training_data$LandSlope == 2,])
+nrow(training_data[training_data$LandSlope == 3,])
+training_data[training_data$LandSlope == 3, 'LandSlope'] <- 2
+boxplot(training_data$SalePrice~training_data$LandSlope,
+        main='SalePrice vs LandSlope'); grid()
+
+summary(test_data$LandSlope)
+test_data$LandSlope <- as.integer(test_data$LandSlope)
+nrow(test_data[test_data$LandSlope == 1,])
+nrow(test_data[test_data$LandSlope == 2,])
+nrow(test_data[test_data$LandSlope == 3,])
+test_data[test_data$LandSlope == 3, 'LandSlope'] <- 2
+# ============================= Done =============================
+# ============================= BldgType =============================
+summary(training_data$BldgType)
+boxplot(training_data$SalePrice~training_data$BldgType,
+        main='SalePrice vs BldgType'); grid()
+training_data$BldgType <- as.integer(training_data$BldgType)
+training_data[training_data$BldgType == 1, 'BldgType'] <- 6
+training_data$BldgType <- training_data$BldgType - 1
+boxplot(training_data$SalePrice~training_data$BldgType,
+        main='SalePrice vs BldgType'); grid()
+
+summary(test_data$BldgType)
+test_data$BldgType <- as.integer(test_data$BldgType)
+test_data[test_data$BldgType == 1, 'BldgType'] <- 6
+test_data$BldgType <- test_data$BldgType - 1
+# ============================= Done =============================
+# ============================= BsmtExposure =============================
+summary(training_data$BsmtExposure)
+boxplot(training_data$SalePrice~training_data$BsmtExposure,
+         main='SalePrice vs BsmtExposure'); grid()
+training_data$BsmtExposure <- as.integer(training_data$BsmtExposure)
+nrow(training_data[training_data$BsmtExposure == 1,])
+training_data[training_data$BsmtExposure == 1, 'BsmtExposure'] <- 3
+training_data$BsmtExposure <- training_data$BsmtExposure - 1
+boxplot(training_data$SalePrice~training_data$BsmtExposure,
+         main='SalePrice vs BsmtExposure'); grid()
+
+summary(test_data$BsmtExposure)
+test_data$BsmtExposure <- as.integer(test_data$BsmtExposure)
+nrow(test_data[test_data$BsmtExposure == 1,])
+test_data[test_data$BsmtExposure == 1, 'BsmtExposure'] <- 3
+test_data$BsmtExposure <- test_data$BsmtExposure - 1
+# ============================= Done =============================
+# ============================= BsmtExposure =============================
+summary(training_data$BsmtFinType1)
+boxplot(training_data$SalePrice~training_data$BsmtFinType1,
+        main='SalePrice vs BsmtFinType1'); grid()
+training_data$BsmtFinType1 <- as.integer(training_data$BsmtFinType1)
+training_data[training_data$BsmtFinType1 == 4, 'BsmtFinType1'] <- 5
+training_data[training_data$BsmtFinType1 == 2, 'BsmtFinType1'] <- 5
+training_data[training_data$BsmtFinType1 == 1, 'BsmtFinType1'] <- 5
+# swap
+training_data[training_data$BsmtFinType1 == 6, 'BsmtFinType1'] <- 8
+training_data[training_data$BsmtFinType1 == 5, 'BsmtFinType1'] <- 6
+training_data[training_data$BsmtFinType1 == 8, 'BsmtFinType1'] <- 5
+training_data$BsmtFinType1 <- training_data$BsmtFinType1 - 2
+boxplot(training_data$SalePrice~training_data$BsmtFinType1,
+        main='SalePrice vs BsmtFinType1'); grid()
+
+summary(test_data$BsmtFinType1)
+test_data$BsmtFinType1 <- as.integer(test_data$BsmtFinType1)
+test_data[test_data$BsmtFinType1 == 4, 'BsmtFinType1'] <- 5
+test_data[test_data$BsmtFinType1 == 2, 'BsmtFinType1'] <- 5
+test_data[test_data$BsmtFinType1 == 1, 'BsmtFinType1'] <- 5
+# swap
+test_data[test_data$BsmtFinType1 == 6, 'BsmtFinType1'] <- 8
+test_data[test_data$BsmtFinType1 == 5, 'BsmtFinType1'] <- 6
+test_data[test_data$BsmtFinType1 == 8, 'BsmtFinType1'] <- 5
+test_data$BsmtFinType1 <- test_data$BsmtFinType1 - 2
+
+summary(training_data$BsmtFinType2)
+boxplot(training_data$SalePrice~training_data$BsmtFinType2,
+        main='SalePrice vs BsmtFinType2'); grid()
+training_data$BsmtFinType2 <- as.integer(training_data$BsmtFinType2)
+training_data[training_data$BsmtFinType2 == 2, 'BsmtFinType2'] <- 4
+training_data[training_data$BsmtFinType2 == 5, 'BsmtFinType2'] <- 4
+training_data[training_data$BsmtFinType2 == 3, 'BsmtFinType2'] <- 2
+training_data[training_data$BsmtFinType2 == 6, 'BsmtFinType2'] <- 3
+training_data[training_data$BsmtFinType2 == 7, 'BsmtFinType2'] <- 5
+#swap
+training_data[training_data$BsmtFinType2 == 1, 'BsmtFinType2'] <- 6
+training_data[training_data$BsmtFinType2 == 2, 'BsmtFinType2'] <- 1
+training_data[training_data$BsmtFinType2 == 6, 'BsmtFinType2'] <- 2
+boxplot(training_data$SalePrice~training_data$BsmtFinType2,
+        main='SalePrice vs BsmtFinType2'); grid()
+
+summary(test_data$BsmtFinType2)
+test_data$BsmtFinType2 <- as.integer(test_data$BsmtFinType2)
+test_data[test_data$BsmtFinType2 == 2, 'BsmtFinType2'] <- 4
+test_data[test_data$BsmtFinType2 == 5, 'BsmtFinType2'] <- 4
+test_data[test_data$BsmtFinType2 == 3, 'BsmtFinType2'] <- 2
+test_data[test_data$BsmtFinType2 == 6, 'BsmtFinType2'] <- 3
+test_data[test_data$BsmtFinType2 == 7, 'BsmtFinType2'] <- 5
+#swap
+test_data[test_data$BsmtFinType2 == 1, 'BsmtFinType2'] <- 6
+test_data[test_data$BsmtFinType2 == 2, 'BsmtFinType2'] <- 1
+test_data[test_data$BsmtFinType2 == 6, 'BsmtFinType2'] <- 2
+# ============================= Done =============================
+# ============================= Heating =============================
+summary(training_data$HeatingQC)
+boxplot(training_data$SalePrice~training_data$HeatingQC,
+        main='SalePrice vs HeatingQC'); grid()
+training_data$HeatingQC <- recode(training_data$HeatingQC, 'Ex' = 5, 'Gd' = 4, 'TA' = 3, 'Fa' = 2, 'Po' = 1)
+test_data$HeatingQC <- recode(test_data$HeatingQC, 'Ex' = 5, 'Gd' = 4, 'TA' = 3, 'Fa' = 2, 'Po' = 1)
+boxplot(training_data$SalePrice~training_data$HeatingQC,
+        main='SalePrice vs HeatingQC'); grid()
+# ============================= Done =============================
+# ============================= Electrical =============================
+summary(training_data$Electrical)
+boxplot(training_data$SalePrice~training_data$Electrical,
+        main='SalePrice vs Electrical'); grid()
+levels(training_data$Electrical)
+training_data$Electrical <- recode(training_data$Electrical, 'SBrkr' = 5, 'None' = 5, 'FuseA' = 4, 'FuseF' = 3, 'FuseP' = 2, 'Mix' = 1)
+test_data$Electrical <- recode(test_data$Electrical, 'SBrkr' = 5, 'None' = 5, 'FuseA' = 4, 'FuseF' = 3, 'FuseP' = 2, 'Mix' = 1)
+boxplot(training_data$SalePrice~training_data$Electrical,
+        main='SalePrice vs Electrical'); grid()
+# ============================= Done =============================
+# ============================= KitchenQual =============================
+summary(training_data$KitchenQual)
+boxplot(training_data$SalePrice~training_data$KitchenQual,
+        main='SalePrice vs KitchenQual'); grid()
+training_data$KitchenQual <- recode(training_data$KitchenQual, 'Ex' = 5, 'Gd' = 4, 'TA' = 3, 'Fa' = 2, 'Po' = 1)
+test_data$KitchenQual <- recode(test_data$KitchenQual, 'Ex' = 5, 'Gd' = 4, 'TA' = 3, 'Fa' = 2, 'Po' = 1)
+boxplot(training_data$SalePrice~training_data$KitchenQual,
+        main='SalePrice vs KitchenQual'); grid()
+# ============================= Done =============================
+# ============================= Neighborhood =============================
+summary(training_data$Neighborhood)
+boxplot(training_data$SalePrice~training_data$Neighborhood,
+        main='SalePrice vs Neighborhood'); grid()
+training_data$Neighborhood <- recode(training_data$Neighborhood,
+                                     'NridgHt' = 15, 'NoRidge' = 14, 'StoneBr' = 13,
+                                     'Somerst' = 12, 'Timber' = 12, 'Veenker' = 12,
+                                     'ClearCr' = 11, 'CollgCr' = 11, 'Crawfor' = 11,
+                                     'Blmngtn' = 10, 'SawyerW' = 9,
+                                     'Gilbert' = 8, 'NWAmes' = 8,
+                                     'Mitchel' = 7, 'NAmes' = 6, 'SWISU' = 6, 'NPkVill' = 6,
+                                     'Blueste' = 5, 'Sawyer' = 5,
+                                     'BrkSide' = 4, 'Edwards' = 4, 'OldTown' = 4,
+                                     'BrDale' = 3, 'IDOTRR' = 2, 'MeadowV' = 1)
+test_data$Neighborhood <- recode(test_data$Neighborhood,
+                                     'NridgHt' = 15, 'NoRidge' = 14, 'StoneBr' = 13,
+                                     'Somerst' = 12, 'Timber' = 12, 'Veenker' = 12,
+                                     'ClearCr' = 11, 'CollgCr' = 11, 'Crawfor' = 11,
+                                     'Blmngtn' = 10, 'SawyerW' = 9,
+                                     'Gilbert' = 8, 'NWAmes' = 8,
+                                     'Mitchel' = 7, 'NAmes' = 6, 'SWISU' = 6, 'NPkVill' = 6,
+                                     'Blueste' = 5, 'Sawyer' = 5,
+                                     'BrkSide' = 4, 'Edwards' = 4, 'OldTown' = 4,
+                                     'BrDale' = 3, 'IDOTRR' = 2, 'MeadowV' = 1)
+boxplot(training_data$SalePrice~training_data$Neighborhood,
+        main='SalePrice vs Neighborhood'); grid()
+# ============================= Done =============================
+```
+
+#### Total Square Feet area of the house
+
+The square feet data available from the csv files is in multiple groups such as basement square feet based on finish type, square feet on first & second floor and some low fininsh quality square feet. Independently, one or more of these might not be present in a house under consideration. However, the combined total square of a house follows a trend and has a positive impact on the sale price of the house. Hence, we disregard the different square feets and merge the sum into one of the columns. Here we're merging it to LowQualFinSF. Which columns we merge it to does not impact the final result. If desired, we could create a new columns like TotalSF.
+
+##### This produced lesser accurate prediction so it is not part of final submission
+
+``` {r SFCombine}
+# ============================= SF =============================
+# plot(training_data$BsmtFinSF1, training_data$SalePrice)
+# plot(training_data$BsmtFinSF2, training_data$SalePrice)
+# plot(training_data$BsmtUnfSF, training_data$SalePrice)
+# plot(training_data$TotalBsmtSF, training_data$SalePrice)
+# plot(training_data$X1stFlrSF, training_data$SalePrice)
+# plot(training_data$X2ndFlrSF, training_data$SalePrice)
+# plot(training_data$LowQualFinSF, training_data$SalePrice)
+# 
+# training_data$LowQualFinSF <- training_data$LowQualFinSF + training_data$X2ndFlrSF + training_data$X1stFlrSF + training_data$TotalBsmtSF + training_data$BsmtUnfSF + training_data$BsmtFinSF2 + training_data$BsmtFinSF1
+# plot(training_data$LowQualFinSF, training_data$SalePrice)
+# training_data$BsmtFinSF1 <- NULL
+# training_data$BsmtFinSF2 <- NULL
+# training_data$BsmtUnfSF <- NULL
+# training_data$TotalBsmtSF <- NULL
+# training_data$X1stFlrSF <- NULL
+# training_data$X2ndFlrSF <- NULL
+# 
+# test_data$LowQualFinSF <- test_data$LowQualFinSF + test_data$X2ndFlrSF + test_data$X1stFlrSF +
+#   test_data$TotalBsmtSF + test_data$BsmtUnfSF + test_data$BsmtFinSF2 +
+#   test_data$BsmtFinSF1
+# 
+# test_data$BsmtFinSF1 <- NULL
+# test_data$BsmtFinSF2 <- NULL
+# test_data$BsmtUnfSF <- NULL
+# test_data$TotalBsmtSF <- NULL
+# test_data$X1stFlrSF <- NULL
+# test_data$X2ndFlrSF <- NULL
+```
+
+#### Log of skewed numeric variables
+
+After the previous steps, we have several categorical variables converted to numeric varaibles. However, they have value in the range 1 - 15. But, for other variables, the range is higher. Also, some variables are skewed. To avoid overweighing their importance in final prediction, we transform them to a log scale.
+
+``` {r logSkewed}
+numericcols <- sapply(training_data, is.numeric) | sapply(training_data, is.integer)
+totnumericcolnames <- names(training_data)[numericcols]
+totfactorcolnames <- names(training_data)[!numericcols]
+length(totnumericcolnames) + length(totfactorcolnames) == 75
+skew <- sapply(totnumericcolnames,function(x){skewness(training_data[[x]],na.rm = T)})
+skew <- skew[skew > 0.75]
+for(x in names(skew)) {
+  training_data[[x]] <- log(training_data[[x]] + 1)
+}
+numericcols <- sapply(test_data, is.numeric) | sapply(test_data, is.integer)
+totnumericcolnames <- names(test_data)[numericcols]
+totfactorcolnames <- names(test_data)[!numericcols]
+length(totnumericcolnames) + length(totfactorcolnames) == 75
+skew <- sapply(totnumericcolnames,function(x){skewness(test_data[[x]],na.rm = T)})
+skew <- skew[skew > 0.75]
+for(x in names(skew)) {
+  test_data[[x]] <- log(test_data[[x]] + 1)
+}
+```
+
+### Training vs validation split
+
+``` {r trainSplit}
+splitdf <- function(dataframe, seed=NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  index <- 1:nrow(dataframe)
+  trainindex <- sample(index, trunc(length(index)/1.5))
+  trainset <- dataframe[trainindex, ]
+  testset <- dataframe[-trainindex, ]
+  list(trainset=trainset,testset=testset)
+}
+splits <- splitdf(training_data, seed=1)
+training <- splits$trainset
+validation <- splits$testset
+
+
+```
+
+### Full regression
+
+``` {r fullReg, echo=TRUE}
+set.seed(121)
+
+# ============================= FULL REGRESSION =============================
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+full.lm.mod <- train(SalePrice ~ ., data = training, 
+                     method = "lm", 
+                     metric = "RMSE",
+                     preProc = c("center", "scale"),
+                     trControl=train_control_config)
+
+for (x in names(validation)) {
+  full.lm.mod$xlevels[[x]] <- union(full.lm.mod$xlevels[[x]], levels(validation[[x]]))
+}
+full.lm.mod.pred <- predict(full.lm.mod, validation[,-ncol(validation)])
+full.lm.mod.pred[is.na(full.lm.mod.pred)] <- 0
+
+my_data=as.data.frame(cbind(predicted=full.lm.mod.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(predicted,observed))+
+  geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+paste("Full Linear Regression RMSE = ", sqrt(mean((full.lm.mod.pred - validation$SalePrice)^2)))
+# ============================= DONE =============================
+```
+
+### Full regression with chi squared
+
+``` {r fullRegChi}
+# ============================= FULL REGRESSION =============================
+weights<- data.frame(chi.squared(SalePrice~., training_data))
+weights$feature <- rownames(weights)
+weights[order(weights$attr_importance, decreasing = TRUE),]
+chi_squared_features <- weights$feature[weights$attr_importance >= 0.1]
+
+chi_squared.lm.mod <- train(SalePrice ~ ., data = training[append(chi_squared_features, "SalePrice")], 
+                            method = "lm", 
+                            metric = "RMSE",
+                            preProc = c("center", "scale"),
+                            trControl=train_control_config)
+for (x in names(validation)) {
+  chi_squared.lm.mod$xlevels[[x]] <- union(chi_squared.lm.mod$xlevels[[x]], levels(validation[[x]]))
+}
+chi_squared.lm.mod.pred <- predict(chi_squared.lm.mod, validation[,-ncol(validation)])
+chi_squared.lm.mod.pred[is.na(chi_squared.lm.mod.pred)] <- 0
+
+my_data=as.data.frame(cbind(predicted=chi_squared.lm.mod.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(predicted,observed))+
+  geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") +
+  ggtitle('Linear Model')
+
+paste("Chi-Squared Filtered Linear Regression RMSE = ", sqrt(mean((chi_squared.lm.mod.pred - validation$SalePrice)^2)))
+# ============================= DONE =============================
+```
+
+### Regression with information gain variables
+
+``` {r infoGain}
+# ============================= INFORMATION GAIN MODEL =============================
+weights<- data.frame(information.gain(SalePrice~., training_data))
+weights$feature <- rownames(weights)
+weights[order(weights$attr_importance, decreasing = TRUE),]
+information_gain_features <- weights$feature[weights$attr_importance >= 0.05]
+
+ig.lm.mod <- train(SalePrice ~ ., data = training[append(information_gain_features, "SalePrice")], 
+                   method = "lm", 
+                   metric = "RMSE",
+                   preProc = c("center", "scale"),
+                   trControl=train_control_config)
+
+for (x in names(validation)) {
+  ig.lm.mod$xlevels[[x]] <- union(ig.lm.mod$xlevels[[x]], levels(validation[[x]]))
+}
+ig.lm.mod.pred <- predict(ig.lm.mod, validation[,-ncol(validation)])
+ig.lm.mod.pred[is.na(ig.lm.mod.pred)] <- 0
+
+my_data=as.data.frame(cbind(predicted=ig.lm.mod.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(predicted,observed))+
+  geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") +
+  ggtitle('Linear Model')
+paste("IG Filtered Linear Regression RMSE = ", sqrt(mean((ig.lm.mod.pred - validation$SalePrice)^2)))
+# ============================= DONE =============================
+```
+
+### Backward step-wise regression
+
+``` {r backStep}
+
+# ============================= BACKWARD STEPWISE =============================
+training <- training[append(information_gain_features, "SalePrice")]
+validation <- validation[append(information_gain_features, "SalePrice")]
+
+train_control_config_4_stepwise <- trainControl(method = "none")
+
+backward.lm.mod <- train(SalePrice ~ ., data = training, 
+                         method = "glmStepAIC", 
+                         direction = "backward",
+                         trace = FALSE,
+                         metric = "RMSE",
+                         steps = 5,
+                         preProc = c("center", "scale"),
+                         trControl=train_control_config_4_stepwise)
+
+paste("Features Selected" ,backward.lm.mod$finalModel$formula[3])
+for (x in names(validation)) {
+  backward.lm.mod$xlevels[[x]] <- union(backward.lm.mod$xlevels[[x]], levels(validation[[x]]))
+}
+backward.lm.mod.pred <- predict(backward.lm.mod, validation[,-ncol(validation)])
+backward.lm.mod.pred[is.na(backward.lm.mod.pred)] <- 0
+
+
+
+paste("Forward Linear Regression RMSE = ", sqrt(mean((backward.lm.mod.pred - validation$SalePrice)^2)))
+my_data=as.data.frame(cbind(predicted=backward.lm.mod.pred,observed=validation$SalePrice))
+ggplot(my_data,aes(predicted,observed))+
+  geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") +
+  ggtitle('Linear Model')
+# ============================= DONE =============================
+```
+
+### Forward step-wise regression
+
+``` {r frontStep}
+# ============================= FORWARD STEPWISE =============================
+forward.lm.mod <- train(x = training[-ncol(training)], y = training$SalePrice,
+                        method = "glmStepAIC", 
+                        direction = "forward",
+                        steps = 10,
+                        trace=FALSE,
+                        metric = "RMSE",
+                        preProc = c("center", "scale"),
+                        trControl=train_control_config_4_stepwise)
+
+paste("Features Selected" ,forward.lm.mod$finalModel$formula[3])
+
+for (x in names(validation)) {
+  forward.lm.mod$xlevels[[x]] <- union(forward.lm.mod$xlevels[[x]], levels(validation[[x]]))
+}
+
+forward.lm.mod.pred <- predict(forward.lm.mod, validation[,-which(names(validation) %in% c("SalePrice"))])
+forward.lm.mod.pred[is.na(forward.lm.mod.pred)] <- 0
+
+paste("Forward Linear Regression RMSE = ", sqrt(mean((forward.lm.mod.pred - validation$SalePrice)^2)))
+
+my_data=as.data.frame(cbind(predicted=forward.lm.mod.pred,observed=validation$SalePrice))
+ggplot(my_data,aes(predicted,observed))+
+  geom_point() + geom_smooth(method = "lm") +
+  labs(x="Predicted") +
+  ggtitle('Linear Model')
+# ============================= DONE =============================
+```
+
+### Ridge regression model
+
+``` {r ridgeReg}
+# ============================= RIDGE LAMBDA =============================
+forward_features <- c("OverallQual", "Neighborhood", "GrLivArea", "BsmtFinSF1" ,"MSSubClass", "OverallCond", "GarageCars", "YearBuilt", "LotArea", "MSZoning")
+
+lambdas <- 10^seq(-2, 1, by = .1)
+#lambdas <- 10^seq(-20, 20, by = .1)
+#ridge.mod <- glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 0, lambda = lambdas)
+ridge.mod <- glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 0, lambda = lambdas)
+
+RMSE = numeric(length(lambdas))
+for (i in seq_along(lambdas)){
+  ridge.pred=predict(ridge.mod, s=lambdas[i], data.matrix(validation[, -ncol(training)]))
+  RMSE[i] <- sqrt(mean((ridge.pred - validation$SalePrice)^2))
+}
+plot(lambdas, RMSE, main="Ridge", log="x", type = "b")
+
+ridge.cv_fit <- cv.glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 0, lambda = lambdas)
+plot(ridge.cv_fit)
+
+bestlam <- ridge.cv_fit$lambda.min
+paste("Best Lambda value from CV=", bestlam)
+ridge.pred=predict(ridge.mod, s=bestlam, data.matrix(validation[, -ncol(training)]))
+paste("RMSE for lambda ", bestlam, " = ", sqrt(mean((ridge.pred - validation$SalePrice)^2)))
+
+lam1se <- ridge.cv_fit$lambda.1se
+paste("Lambda 1se value from CV=", lam1se)
+ridge.pred=predict(ridge.mod, s=lam1se, data.matrix(validation[, -ncol(training)]))
+paste("RMSE for lambda ", lam1se, " = ", sqrt(mean((ridge.pred - validation$SalePrice)^2)))
+
+
+
+
+my_data=as.data.frame(cbind(predicted=ridge.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(my_data["1"],observed))+
+  geom_point()+geom_smooth(method="lm")+
+  scale_x_continuous(expand = c(0,0)) +
+  labs(x="Predicted") +
+  ggtitle('Ridge')
+# Print, plot variable importance
+imp <- varImp(ridge.mod, lambda = bestlam)
+names <- rownames(imp)[order(imp$Overall, decreasing=TRUE)]
+importance <- imp[names,]
+
+data.frame(row.names = names, importance)
+# ============================= DONE =============================
+```
+
+### LASSO Regression
+
+``` {r lassoReg}
+# ============================= LASSO =============================
+lambdas <- 10^seq(-3, 3, by = .1)
+
+lasso.cv_fit <- cv.glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+plot(lasso.cv_fit)
+
+bestlam <- lasso.cv_fit$lambda.min
+paste("Best Lambda value from CV=", bestlam)
+lasso.mod <- glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+lasso.pred=predict(lasso.mod, s=bestlam, data.matrix(validation[, -ncol(training)]))
+paste("RMSE for lambda ", bestlam, " = ", sqrt(mean((lasso.pred - validation$SalePrice)^2)))
+
+
+lam1se <- lasso.cv_fit$lambda.1se
+paste("Lambda 1se value from CV=", lam1se)
+lasso.mod <- glmnet(x = data.matrix(training[, -ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+lasso.pred=predict(lasso.mod, s=lam1se, data.matrix(validation[, -ncol(training)]))
+paste("RMSE for lambda ", lam1se, " = ", sqrt(mean((lasso.pred - validation$SalePrice)^2)))
+
+# Plot important coefficients
+my_data=as.data.frame(cbind(predicted=lasso.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(my_data["1"],observed))+
+  geom_point()+geom_smooth(method="lm")+
+  scale_x_continuous(expand = c(0,0)) +
+  labs(x="Predicted") +
+  ggtitle('Lasso')
+
+# Print, plot variable importance
+imp <- varImp(lasso.mod, lambda = bestlam)
+names <- rownames(imp)[order(imp$Overall, decreasing=TRUE)]
+importance <- imp[names,]
+
+data.frame(row.names = names, importance)
+
+filtered_names <- rownames(imp)[order(imp$Overall, decreasing=TRUE)][1:28]
+print(filtered_names)
+
+log_prediction <- predict(lasso.cv_fit,  s=lasso.cv_fit$lambda.min, newx = data.matrix(test_data[information_gain_features]))
+actual_pred <- exp(log_prediction)-1
+hist(actual_pred)
+```
+
+## Preparing csv file for submission
+
+``` {r submitPrep}
+submit <- data.frame(Id=test_data$Id,SalePrice=actual_pred)
+colnames(submit) <-c("Id", "SalePrice")
+
+submit$SalePrice[is.na(submit$SalePrice)] <- 0
+replace_value_for_na <- sum(na.omit(submit$SalePrice))/(nrow(submit) - sum(submit$SalePrice == 0))
+submit$SalePrice[submit$SalePrice == 0] <- replace_value_for_na
+
+write.csv(submit,file="submit.csv",row.names=F)
+# ============================= DONE =============================
+```
